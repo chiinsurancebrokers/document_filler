@@ -158,11 +158,25 @@ def get_font() -> str:
 
 def register_font(path: str) -> str:
     name = "FormFont"
-    try:
-        pdfmetrics.registerFont(TTFont(name, path))
-        return name
-    except Exception:
-        return "Helvetica"
+    if not path:
+        # Helvetica does not support Greek — search harder for a Unicode font
+        extra = [
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ]
+        for fp in extra:
+            if os.path.exists(fp):
+                path = fp
+                break
+    if path:
+        try:
+            pdfmetrics.registerFont(TTFont(name, path))
+            return name
+        except Exception:
+            pass
+    # Last resort: Helvetica (Latin only — Greek will be blank)
+    return "Helvetica"
 
 
 def pdf_to_images(pdf_bytes: bytes, max_pages: int = 5, dpi: int = 150) -> list[Image.Image]:
@@ -224,13 +238,21 @@ def phase0_classify(client, uploads: list[dict]) -> list[dict]:
 Look at this document carefully.
 
 Classify it as ONE of:
-- "form"   → a blank or partially blank form/application/claim form that needs to be FILLED IN
-             (has empty fields, lines, boxes, checkboxes waiting for input)
-- "source" → a source document containing data/information to USE when filling a form
-             (invoice, receipt, ID, insurance card, medical report, referral letter, policy document, etc.)
+- "form"   → a form/application that needs to be FILLED IN by a person.
+             Signs: dotted lines ".....", blank boxes |__|__|__|, empty radio circles ○,
+             placeholder text like "HH|MM|EEEE", field labels followed by blank space,
+             sections labeled "ΣΤΟΙΧΕΙΑ ΣΥΜΒΑΛΛΟΜΕΝΟΥ", "ΣΤΟΙΧΕΙΑ ΟΧΗΜΑΤΟΣ" etc.
+             A form can have SOME pre-filled content (like a pre-ticked checkbox or
+             a pre-printed application number) and still be a form.
+- "source" → a completed document with real data already filled in — used as a data source.
+             Examples: issued insurance policy (ασφαλιστήριο), vehicle registration,
+             ID card, invoice, completed contract, policy certificate.
+
+Key distinction: if the document has MANY empty fields waiting for user input → "form".
+If it is a fully completed/issued document with actual data → "source".
 
 Also detect:
-- language: main language of the document (e.g. "English", "Greek", "French")
+- language: main language (e.g. "Greek", "English")
 - description: one sentence describing what this document is
 
 Return ONLY JSON (no markdown):
@@ -250,7 +272,7 @@ Return ONLY JSON (no markdown):
 
 def phase1_analyze_form(client, form_doc: dict) -> list[dict]:
     """Detect every fillable field in the form with % coordinates."""
-    imgs = pdf_to_images(form_doc["bytes"], max_pages=6)
+    imgs = pdf_to_images(form_doc["bytes"], max_pages=9)
     content = images_to_content(imgs, "BLANK FORM")
     content.append({"type": "text", "text": """
 Analyze this blank form carefully. Find EVERY fillable area:
@@ -298,10 +320,11 @@ def phase2_extract_sources(client, source_docs: list[dict]) -> dict:
             if lang.lower() not in ("english", "unknown") else ""
         )
         content.append({"type": "text", "text": f"""
-{translate_note}
+Read this document thoroughly. Extract EVERY piece of data visible.
 
-Read this document thoroughly. Extract EVERY piece of information that could be used
-to fill a medical/insurance/administrative claim form.
+IMPORTANT: Keep ALL text values in their ORIGINAL LANGUAGE (do NOT translate names,
+addresses, plate numbers, company names, or any field values). Use English only for
+the JSON key names.
 
 Return ONLY JSON (no markdown):
 {{
@@ -314,23 +337,24 @@ Return ONLY JSON (no markdown):
   }}
 }}
 
-Use descriptive English keys such as:
-policyholder_title, policyholder_forename, policyholder_surname,
-policy_number, correspondence_address, postcode, city, country,
-phone, mobile, email,
-patient_title, patient_forename, patient_surname, patient_dob,
-illness_description, symptoms_date, treatment_type, treatment_date,
-invoice_number, invoice_date, invoice_amount, invoice_currency,
-provider_name, provider_address, provider_phone,
-doctor_name, doctor_qualifications, doctor_license,
-hospital_name, hospital_address, hospital_phone,
-referral_date, diagnosis, icd_code,
-is_new_claim (true/false), is_accident (true/false),
-other_insurance (true/false), state_care (true/false)
+Use descriptive English keys. For car insurance documents include keys such as:
+policyholder_company_name, policyholder_afm, policyholder_address, policyholder_city,
+policyholder_postcode, policyholder_mobile, policyholder_email,
+insured_name, policy_number, policy_start_date, policy_end_date,
+vehicle_plate, vehicle_chassis, vehicle_make, vehicle_model, vehicle_type,
+vehicle_use, vehicle_cc, vehicle_hp, vehicle_seats, vehicle_year,
+vehicle_insured_value, insurance_program, insurance_duration,
+new_driver_under_23 (true/false), new_driver_dob,
+new_driver_license_under_1yr (true/false),
+coverage_legal_protection (true/false), coverage_roadside (true/false),
+coverage_glass (true/false), coverage_natural_disasters_extra (true/false),
+coverage_airbags (true/false), coverage_wrong_fuel (true/false),
+coverage_friendly_settlement (true/false),
+broker_name, broker_code, broker_afm, broker_registry,
+premium_net, premium_total
 
 Include ALL values you can read. For booleans use true/false.
 For dates use DD/MM/YYYY format.
-Translate any non-English text values to English.
 """})
         raw = call_claude(client, content,
                           "You are a multilingual data extraction expert. Output ONLY valid JSON.",
@@ -352,7 +376,7 @@ Translate any non-English text values to English.
 def phase3_map_and_fill(client, fields: list[dict],
                          data: dict, form_doc: dict) -> list[dict]:
     """Generate precise fill instructions for every matched field."""
-    imgs = pdf_to_images(form_doc["bytes"], max_pages=6)
+    imgs = pdf_to_images(form_doc["bytes"], max_pages=9)
     content = images_to_content(imgs, "BLANK FORM")
 
     # Remove internal key before sending
@@ -372,13 +396,15 @@ Task: For each form field that has matching data, generate a fill instruction.
 Rules:
 - x, y are TOP-LEFT corner of where to write (use field's x, y values exactly)
 - font_size (6–10): choose so text fits within the field width w × page_width
-- For radio/checkbox "Yes": use "●" at the Yes button position
-- For radio/checkbox "No":  use "●" at the No button position  
-- For "Is this a new claim?" → Yes, use "●" at the Yes radio position
-- For "Is this related to an accident?" → No, use "●" at the No radio position
-- For invoice table rows: fill date_of_treatment, description, currency+amount, payee
-- For the date field in section 5 (patient signature date): use today's date
-- Skip fields that have no matching data (doctor signature, stamps, etc.)
+- For radio buttons / checkboxes: use "X" (capital X) at the circle/box position
+- For YES/NO questions: place "X" at the appropriate radio circle coordinates
+- Keep ALL text values in their original language (Greek names, addresses, plate numbers stay in Greek)
+- For the Αριθμός Συμβολαίου field: use the policy_number value
+- For vehicle fields: use vehicle_plate, vehicle_chassis, vehicle_make + vehicle_model, vehicle_use, etc.
+- For new driver section: if new_driver_under_23=true place X at NAI radio, otherwise at OXI radio
+- For insurance program: place X at the BASIC/EXTRA/TOTAL radio that matches insurance_program
+- For optional coverages (Προαιρετικές Καλύψεις): place X in NAI column if coverage is true, OXI if false
+- Skip fields that have no matching data (signatures, stamps, DOY if unknown, etc.)
 - NEVER invent data that isn't in the extracted data
 
 Return ONLY JSON (no markdown):
@@ -646,7 +672,7 @@ def main():
         defs = {
             0: ("🔍 Classifying Documents",         "AI reads each PDF and decides: blank form vs source doc"),
             1: ("📐 Analyzing Form Structure",       "AI maps every field in the blank form with coordinates"),
-            2: ("📖 Extracting & Translating Data",  "AI reads source docs, translates non-English content"),
+            2: ("📖 Extracting Data",  "AI reads source docs, extracts all data in original language"),
             3: ("🧠 Mapping Data → Fields",          "AI generates precise fill instructions for each field"),
             4: ("✍️ Rendering Filled PDF",            "Overlaying extracted data onto the original form"),
         }
@@ -729,7 +755,7 @@ def main():
 
         ph_state[2] = "done"; render_phases()
 
-        with st.expander(f"✓ Phase 2 — {len(data) - 1} data points extracted", expanded=False):
+        with st.expander(f"✓ Phase 2 — {len([k for k in data if not k.startswith("_")])} data points extracted", expanded=False):
             for s in data.get("_summaries", []):
                 st.markdown(s)
             clean = {k: v for k, v in data.items() if not k.startswith("_")}
